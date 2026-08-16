@@ -1,17 +1,20 @@
 @echo off
-chcp 65001 >nul
-title 机场节点测速 · Web 版
+title Airport Speedtest Web
 cd /d "%~dp0"
 echo.
 echo  ============================================================
-echo    机场节点测速 · Web 版  (StairSpeedTest 风格 · 防失真)
+echo    Airport Speedtest Web  (StairSpeedTest style + anti-fake)
 echo  ============================================================
+echo.
+echo  Starting web service, please wait...
+echo  URL:  http://127.0.0.1:8787   (browser will open automatically)
+echo  Close this window to stop the service.
 echo.
 python webapp.py %*
 if errorlevel 1 (
   echo.
-  echo  [错误] 启动失败。请确认已安装 Python 3.8+ 并执行过:
-  echo         pip install -r requirements.txt
+  echo  [ERROR] Failed to start. Check Python 3.8+ installed:
+  echo          pip install -r requirements.txt
   echo.
   pause
 )
