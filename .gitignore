@@ -1,0 +1,21 @@
+# runtime artifacts
+work/
+__pycache__/
+*.pyc
+
+# kernels & databases (auto-downloaded on first run)
+tools/mihomo.exe
+tools/mihomo-*.zip
+tools/geoip.metadb
+
+# test results (regenerable)
+result_*.json
+result_*.csv
+result_report_*.png
+result_report_*.html
+deep_results_*.json
+progress.json
+
+# OS junk
+Thumbs.db
+.DS_Store
