@@ -1645,8 +1645,8 @@ def main():
     ap.add_argument("--sweep", action="store_true",
                     help="并发快扫模式（StairSpeedTest 风格）：多实例并发测全部节点 + 前N名串行精测")
     ap.add_argument("--no-sweep", action="store_true", help="禁用并发快扫（回到纯串行）")
-    ap.add_argument("--concurrency", type=int, default=6,
-                    help="并发快扫同时测几个节点（默认 6；并发越多越快但会分摊带宽，快扫仅用于初筛）")
+    ap.add_argument("--concurrency", type=int, default=4,
+                    help="并发快扫同时测几个节点（默认 4；2~4 为安全区，越高越快但分摊带宽越狠、弱机场晚高峰易连接失败；快扫仅用于初筛）")
     ap.add_argument("--last-round-concurrency", type=int, default=2,
                     help="最后一轮用的并发数（默认 2，节点少时更准）")
     ap.add_argument("--sweep-duration", type=int, default=6,

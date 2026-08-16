@@ -793,7 +793,7 @@ img{max-width:100%;border-radius:14px;border:1px solid rgba(148,163,184,.12);mar
       <option value="emby">Emby 压力 · 快扫+晚高峰压测</option>
       <option value="full">完整 · 全部节点逐个精测</option>
     </select></div>
-    <div><label>快扫并发</label><input type="number" id="concurrency" value="6" min="1" max="12" title="并发越高快扫越快，但会分摊带宽（快扫仅初筛，精测不受影响）"></div>
+    <div><label>快扫并发</label><input type="number" id="concurrency" value="4" min="1" max="12" title="建议 2~4：并发越高越快但每节点分摊带宽越多、弱机场晚高峰易连接失败（快扫仅初筛，精测不受影响）"></div>
     <div><label>精测时长(秒)</label><input type="number" id="duration" value="15" min="5" max="120"></div>
     <div><label>Top N 精测</label><input type="number" id="fast_top" value="5" min="1" max="30" title="快扫后对评分前 N 的节点做权威精测"></div>
     <div><label>测试轮数</label><input type="number" id="rounds" value="1" min="1" max="12" title="精测重复轮数：多轮覆盖晚高峰波动，最后自动汇总均值/一致性出综合报告"></div>
@@ -801,7 +801,7 @@ img{max-width:100%;border-radius:14px;border:1px solid rgba(148,163,184,.12);mar
     <div><label>节点上限(0=全部)</label><input type="number" id="limit" value="0" min="0"></div>
     <div><label>Ookla 深测(0=关)</label><input type="number" id="ookla" value="0" min="0" max="10"></div>
     <div><label>测速源</label><select id="test_source" title="机场可能对不同源限速不同：测速源数字低但 Emby 快，就换源。最准是 Emby 服务器模式——直接测你看片走的真实路径">
-      <option value="default">默认 · Google CDN 防失真列表</option>
+      <option value="default" selected>默认 · Google CDN 防失真列表（推荐）</option>
       <option value="emby">Emby 服务器（自动找大影片，最准）</option>
       <option value="cachefly">Cachefly 100MB</option>
       <option value="ovh">OVH 10GB</option>
@@ -868,7 +868,7 @@ function startRun(){
   const params={duration:+document.getElementById('duration').value||15,
     limit:+document.getElementById('limit').value||0,
     mode:document.getElementById('mode').value,
-    concurrency:+document.getElementById('concurrency').value||6,
+    concurrency:+document.getElementById('concurrency').value||4,
     ookla:+document.getElementById('ookla').value||0,
     fast_top:+document.getElementById('fast_top').value||5,
     rounds:+document.getElementById('rounds').value||1,
