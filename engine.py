@@ -766,13 +766,13 @@ class SpeedTester:
 
         if not _put():
             return False
-        time.sleep(0.5)
+        time.sleep(0.3)   # 提速：缩短验证等待（仍强制回读验证，真实性不变）
         if _now() == name:
             return True
         # 重试一次，仍失败则判定为选择未生效（防失真：宁可不测，不可测错）
         if not _put():
             return False
-        time.sleep(0.6)
+        time.sleep(0.4)
         return _now() == name
 
     def download_once(self, url, via_proxy=True, duration=0, warmup=0):
@@ -1443,7 +1443,7 @@ def main():
                     help="生成 PNG 评分图 + HTML 报告（StairSpeedTest 风格）")
     ap.add_argument("--accurate", action="store_true",
                     help="精准模式：串行逐节点，预热+稳态，单/多线程分开测（数据最准，不追求速度）")
-    ap.add_argument("--warmup", type=int, default=3, help="精准模式预热秒数（丢弃慢启动，默认 3）")
+    ap.add_argument("--warmup", type=int, default=2, help="精准模式预热秒数（丢弃慢启动，默认 2）")
     ap.add_argument("--adaptive", action="store_true",
                     help="自适应淘汰：连续不达标节点降级/淘汰，轮次越跑越快（--loop>1 时默认开启）")
     ap.add_argument("--no-adaptive", action="store_true", help="禁用自适应淘汰")
@@ -1456,14 +1456,14 @@ def main():
     ap.add_argument("--sweep", action="store_true",
                     help="并发快扫模式（StairSpeedTest 风格）：多实例并发测全部节点 + 前N名串行精测")
     ap.add_argument("--no-sweep", action="store_true", help="禁用并发快扫（回到纯串行）")
-    ap.add_argument("--concurrency", type=int, default=4,
-                    help="并发快扫同时测几个节点（默认 4；并发越多越快但会分摊带宽）")
+    ap.add_argument("--concurrency", type=int, default=6,
+                    help="并发快扫同时测几个节点（默认 6；并发越多越快但会分摊带宽，快扫仅用于初筛）")
     ap.add_argument("--last-round-concurrency", type=int, default=2,
                     help="最后一轮用的并发数（默认 2，节点少时更准）")
     ap.add_argument("--sweep-duration", type=int, default=6,
                     help="快扫时每节点短测秒数（默认 6）")
     ap.add_argument("--test-url", default=None)
-    ap.add_argument("--latency-timeout", type=int, default=5000)
+    ap.add_argument("--latency-timeout", type=int, default=3000, help="延迟测试超时(ms)，默认 3000（提速：死节点更快判定）")
     ap.add_argument("--latency-url", default="http://www.gstatic.com/generate_204")
     ap.add_argument("--probes", type=int, default=5,
                     help="每节点丢包/延迟探测次数（默认 5，越大越准越慢）")
