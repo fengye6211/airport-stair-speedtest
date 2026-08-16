@@ -33,12 +33,14 @@ import argparse
 import base64
 import csv
 import datetime
+import glob
 import json
 import os
 import re
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -59,12 +61,54 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
+FROZEN = bool(getattr(sys, "frozen", False))
+TOOL_DIR = os.path.dirname(os.path.abspath(__file__))  # PyInstaller 冻结时 = _MEIPASS（只读资源）
 TOOLS_DIR = os.path.join(TOOL_DIR, "tools")
-WORK_DIR = os.path.join(TOOL_DIR, "work")
 MIHOMO_EXE = os.path.join(TOOLS_DIR, "mihomo.exe")
+# 运行时目录（work/progress/result 临时产物）：一律用系统临时目录——结果默认不落项目目录；
+# 冻结(exe)模式下它同时是父/子进程共享的固定路径（_MEIPASS 每次启动都不同，不能共享）。
+# 防互删：webapp 会按端口注入 AST_RUNTIME_DIR（多实例各自独立，互不清理对方的进度/结果）
+RUNTIME_DIR = os.environ.get("AST_RUNTIME_DIR") or os.path.join(tempfile.gettempdir(), "airport-speedtest")
+WORK_DIR = os.path.join(RUNTIME_DIR, "work")
+# --save 时结果文件的落盘位置：exe 旁（冻结）或项目目录
+SAVE_DIR = os.path.dirname(sys.executable) if FROZEN else TOOL_DIR
 DEFAULT_UA = "ClashForWindows/0.20.39"
 MIHOMO_API = "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
+
+# 测速下载的自定义请求头（--test-ua 设置；Emby 源用客户端 UA 绕过"禁网页播放"的服务器）
+TEST_DOWNLOAD_HEADERS = {}
+
+
+def cleanup_runtime(keep_progress=False):
+    """清理临时运行目录中的历史产物（结果默认不保留；progress 保留给进行中的 UI 轮询）"""
+    import glob as _g
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
+    for f in _g.glob(os.path.join(RUNTIME_DIR, "result*")):
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+    if not keep_progress:
+        for f in _g.glob(os.path.join(RUNTIME_DIR, "progress.*")):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+
+
+def copy_artifacts_to_save(stamp):
+    """--save：把本次运行（按时间戳）的结果文件从临时目录复制到 SAVE_DIR。返回复制数。"""
+    import glob as _g
+    import shutil
+    n = 0
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    for f in _g.glob(os.path.join(RUNTIME_DIR, f"result*{stamp}*")):
+        try:
+            shutil.copy2(f, SAVE_DIR)
+            n += 1
+        except Exception:
+            pass
+    return n
 
 SAMPLE_URIS = [
     "ss://YWVzLTI1Ni1nY206cGFzc3dvcmQxMjM=@1.2.3.4:8388#SS%E5%9F%BA%E7%A1%80",
@@ -74,18 +118,59 @@ SAMPLE_URIS = [
     "vless://uuid-1111@8.8.8.8:443?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome&pbk=publickey&sid=shortid&flow=xtls-rprx-vision&type=tcp#VLESS-Reality",
     "vless://uuid-2222@7.7.7.7:8443?encryption=none&security=tls&type=grpc&serviceName=test&sni=grpc.example.com#VLESS-gRPC",
     "ssr://MS4yLjMuNDo0NDM6YXV0aF9hZXMxMjhfbWQ1OmFlcy0yNTYtY2ZiOnRsczEuMl90aWNrZXRfYXV0aDpZV1J0YVdVeVpYUXhNakF3TncvP29iZnNwYXJhbT1iM0JsYmkxMGVYQmwmcmVtYXJrcz1TUlLmtYHkuqTmg4XlhrXkv53lkbw=",
+    "hysteria2://letmein@5.6.7.8:443?sni=cdn.example.com&obfs=salamander&obfs-password=obfspass&insecure=1&upmbps=100&downmbps=500#HY2-CDN",
+    "tuic://uuid-3333:pass456@3.3.3.3:8443?sni=tuic.example.com&alpn=h3&congestion_control=bbr#TUIC-BBR",
 ]
 
 # ---------------------------------------------------------------- 订阅下载
+
+def parse_userinfo_header(header):
+    """解析 subscription-userinfo 响应头（机场流量/到期）：
+    upload=123; download=456; total=107374182400; expire=1735689600"""
+    out = {}
+    if not header:
+        return out
+    for part in header.split(";"):
+        k, _, v = part.strip().partition("=")
+        try:
+            out[k] = int(v)
+        except ValueError:
+            pass
+    return out
+
+def fmt_userinfo(u):
+    """userinfo dict → 可读字符串（None 表示无信息）"""
+    if not u:
+        return None
+    parts = []
+    up, dl, total = u.get("upload", 0), u.get("download", 0), u.get("total", 0)
+    if total or up or dl:
+        used = up + dl
+        if total:
+            parts.append(f"已用 {used / 1073741824:.1f}GB / {total / 1073741824:.1f}GB"
+                         f"（剩余 {max(0, total - used) / 1073741824:.1f}GB）")
+        else:
+            parts.append(f"已用 {used / 1073741824:.1f}GB（总量未知）")
+    exp = u.get("expire")
+    if exp:
+        try:
+            d = datetime.datetime.fromtimestamp(exp)
+            days = (d - datetime.datetime.now()).days
+            parts.append(f"到期 {d:%Y-%m-%d}（剩 {days} 天）")
+        except Exception:
+            pass
+    return " · ".join(parts) if parts else None
 
 def fetch_subscription(url, ua):
     headers = {"User-Agent": ua}
     r = requests.get(url, headers=headers, timeout=30, allow_redirects=True)
     r.raise_for_status()
-    return r.text, r.content
+    userinfo = parse_userinfo_header(r.headers.get("subscription-userinfo"))
+    return r.text, r.content, userinfo
 
 def load_subscription(arg, ua):
-    """输入可以是订阅链接(http/https) 或本地文件路径(也支持 file:// 前缀)"""
+    """输入可以是订阅链接(http/https) 或本地文件路径(也支持 file:// 前缀)。
+    返回 (text, raw, userinfo)；本地文件 userinfo 为空 dict。"""
     if arg.startswith(("http://", "https://")):
         return fetch_subscription(arg, ua)
     path = arg
@@ -96,7 +181,7 @@ def load_subscription(arg, ua):
     if not os.path.exists(path):
         raise FileNotFoundError(f"文件不存在: {path}")
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        return f.read(), None
+        return f.read(), None, {}
 
 # ---------------------------------------------------------------- 节点解析
 
@@ -335,6 +420,82 @@ def parse_ssr(uri, name):
             node["name"] = name or b64decode_safe(params["remarks"][0])
     return node
 
+def parse_hysteria2(uri, name):
+    """hysteria2:// / hy2:// 分享链接 → mihomo hysteria2 节点"""
+    low = uri.lower()
+    rest = uri[len("hy2://"):] if low.startswith("hy2://") else uri[len("hysteria2://"):]
+    frag = ""
+    if "#" in rest:
+        rest, frag = rest.split("#", 1)
+    frag = urllib.parse.unquote(frag)
+    if "@" not in rest:
+        return None
+    auth, hostport = rest.rsplit("@", 1)
+    if "?" in hostport:
+        hostport, q = hostport.split("?", 1)
+    else:
+        q = ""
+    hostport = hostport.rstrip("/")  # 防失真：hysteria2://host:port/?params 格式（问号前带斜杠）
+    if ":" not in hostport:
+        return None
+    host, port = hostport.rsplit(":", 1)
+    params = urllib.parse.parse_qs(q)
+    get = lambda k, d="": params.get(k, [d])[-1]
+    node = {"name": name or frag or f"{host}:{port}", "type": "hysteria2",
+            "server": host, "port": int(port),
+            "password": urllib.parse.unquote(auth), "udp": True}
+    if get("sni"):
+        node["sni"] = get("sni")
+    if get("obfs") == "salamander":
+        node["obfs"] = "salamander"
+        if get("obfs-password"):
+            node["obfs-password"] = get("obfs-password")
+    if get("insecure", "").lower() in ("1", "true"):
+        node["skip-cert-verify"] = True
+    if get("upmbps"):
+        node["up"] = f"{get('upmbps')} Mbps"
+    if get("downmbps"):
+        node["down"] = f"{get('downmbps')} Mbps"
+    if get("alpn"):
+        node["alpn"] = [a for a in get("alpn").split(",") if a]
+    return node
+
+def parse_tuic(uri, name):
+    """tuic://uuid:password@host:port 分享链接 → mihomo tuic 节点"""
+    rest = uri[len("tuic://"):]
+    frag = ""
+    if "#" in rest:
+        rest, frag = rest.split("#", 1)
+    frag = urllib.parse.unquote(frag)
+    if "@" not in rest:
+        return None
+    userinfo, hostport = rest.rsplit("@", 1)
+    if "?" in hostport:
+        hostport, q = hostport.split("?", 1)
+    else:
+        q = ""
+    hostport = hostport.rstrip("/")  # 防失真：tuic://host:port/?params 格式
+    if ":" not in hostport:
+        return None
+    host, port = hostport.rsplit(":", 1)
+    uuid_, _, password = userinfo.partition(":")
+    params = urllib.parse.parse_qs(q)
+    get = lambda k, d="": params.get(k, [d])[-1]
+    node = {"name": name or frag or f"{host}:{port}", "type": "tuic",
+            "server": host, "port": int(port), "uuid": uuid_, "udp": True}
+    if password:
+        node["password"] = urllib.parse.unquote(password)
+    if get("sni"):
+        node["sni"] = get("sni")
+    if get("alpn"):
+        node["alpn"] = [a for a in get("alpn").split(",") if a]
+    cc = get("congestion_control") or get("congestion-controller")
+    if cc:
+        node["congestion-controller"] = cc
+    if get("allow_insecure", "").lower() in ("1", "true") or get("insecure", "").lower() in ("1", "true"):
+        node["skip-cert-verify"] = True
+    return node
+
 def parse_subscription_text(text):
     """解析订阅文本，返回 clash 格式节点列表"""
     lines = []
@@ -343,7 +504,7 @@ def parse_subscription_text(text):
         if line and not line.startswith("#"):
             lines.append(line)
     # 单行 base64（整体解码后再分行）
-    if len(lines) == 1 and not lines[0].lower().startswith(("ss://", "vmess://", "trojan://", "vless://", "ssr://", "http://", "https://", "proxies:")):
+    if len(lines) == 1 and not lines[0].lower().startswith(("ss://", "vmess://", "trojan://", "vless://", "ssr://", "hysteria2://", "hy2://", "tuic://", "http://", "https://", "proxies:")):
         decoded = b64decode_safe(lines[0])
         if decoded:
             lines = [l.strip() for l in decoded.splitlines() if l.strip()]
@@ -359,6 +520,10 @@ def parse_subscription_text(text):
             n = parse_trojan(line, None)
         elif line.lower().startswith("ssr://"):
             n = parse_ssr(line, None)
+        elif line.lower().startswith(("hysteria2://", "hy2://")):
+            n = parse_hysteria2(line, None)
+        elif line.lower().startswith("tuic://"):
+            n = parse_tuic(line, None)
         else:
             n = None
         if n:
@@ -503,7 +668,8 @@ def stream_download(url, proxies, duration, size_bytes, max_time, warmup=0):
     reconnects = 0
     r = None
     try:
-        r = requests.get(url, proxies=proxies, stream=True, timeout=(10, read_timeout))
+        r = requests.get(url, proxies=proxies, stream=True,
+                         timeout=(10, read_timeout), headers=TEST_DOWNLOAD_HEADERS or None)
         while True:
             if r.status_code != 200:
                 last_err = f"HTTP {r.status_code}"
@@ -538,7 +704,8 @@ def stream_download(url, proxies, duration, size_bytes, max_time, warmup=0):
             # 文件读完但时长未到 → 重新请求继续
             r.close()
             try:
-                r = requests.get(url, proxies=proxies, stream=True, timeout=(10, read_timeout))
+                r = requests.get(url, proxies=proxies, stream=True,
+                                 timeout=(10, read_timeout), headers=TEST_DOWNLOAD_HEADERS or None)
             except Exception as e:
                 last_err = str(e)[:120]
                 reconnects += 1
@@ -586,7 +753,8 @@ def stream_download_multi(url, proxies, duration, size_bytes, max_time, threads=
         local = 0
         m_start = None
         try:
-            r = requests.get(url, proxies=proxies, stream=True, timeout=(10, read_timeout))
+            r = requests.get(url, proxies=proxies, stream=True,
+                             timeout=(10, read_timeout), headers=TEST_DOWNLOAD_HEADERS or None)
             while True:
                 if r.status_code != 200:
                     break
@@ -612,7 +780,8 @@ def stream_download_multi(url, proxies, duration, size_bytes, max_time, threads=
                     break
                 r.close()
                 try:
-                    r = requests.get(url, proxies=proxies, stream=True, timeout=(10, read_timeout))
+                    r = requests.get(url, proxies=proxies, stream=True,
+                                     timeout=(10, read_timeout), headers=TEST_DOWNLOAD_HEADERS or None)
                 except Exception:
                     break
         except Exception:
@@ -639,6 +808,82 @@ def stream_download_multi(url, proxies, duration, size_bytes, max_time, threads=
     return {"avg": avg, "min": mn, "max": max(buckets) if buckets else avg,
             "samples": [round(s, 2) for s in buckets],
             "stalls": stalls, "reconnects": 0}, None
+
+# ---------------------------------------------------------------- Emby 压力测试
+
+def percentile(vals, p):
+    """简单百分位（nearest-rank）：P10 = 最差 10% 秒的卡顿线"""
+    if not vals:
+        return None
+    s = sorted(vals)
+    k = max(0, min(len(s) - 1, int(round(p / 100 * (len(s) - 1)))))
+    return s[k]
+
+# Emby 档位（单路持续速度，MB/s）：与 emby_verdict 保持同一套线
+EMBY_TIERS = [(50, "4K原盘"), (30, "4K高码"), (15, "1080p高码"), (8, "1080p")]
+
+def emby_tier_of(mb_s):
+    if mb_s is None:
+        return "未知"
+    for th, name in EMBY_TIERS:
+        if mb_s >= th:
+            return name
+    return "不达标"
+
+def emby_pressure_verdict(worst_stream, streams):
+    """多路并发判定：最差一路决定档位（木桶效应——多设备同时看，最卡那路决定体验）"""
+    if worst_stream is None:
+        return "未测"
+    tier = emby_tier_of(worst_stream)
+    return f"{tier}×{streams}路" if tier != "不达标" else "不达标"
+
+def stream_download_streams(url, proxies, duration, size_bytes, max_time, streams=2):
+    """N 路独立单连接同时持续下载（模拟 N 台设备同时看 Emby）。
+    与 stream_download_multi 的区别：每路独立统计平均速度（不是合计），
+    最差一路的速度才是多设备同时观看的真实体验。"""
+    if duration <= 0:
+        duration = 30.0
+    read_timeout = max(duration + 10, max_time)
+    t0 = time.time()
+    deadline = t0 + duration
+    totals = [0] * streams
+
+    def worker(wi):
+        local = 0
+        try:
+            r = requests.get(url, proxies=proxies, stream=True,
+                             timeout=(10, read_timeout), headers=TEST_DOWNLOAD_HEADERS or None)
+            while True:
+                if r.status_code != 200:
+                    break
+                for chunk in r.iter_content(65536):
+                    if not chunk:
+                        break
+                    local += len(chunk)
+                    if time.time() >= deadline:
+                        break
+                if time.time() >= deadline:
+                    break
+                r.close()
+                try:
+                    r = requests.get(url, proxies=proxies, stream=True,
+                                     timeout=(10, read_timeout), headers=TEST_DOWNLOAD_HEADERS or None)
+                except Exception:
+                    break
+        except Exception:
+            pass
+        totals[wi] = local
+
+    ths = [threading.Thread(target=worker, args=(i,)) for i in range(streams)]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+    elapsed = time.time() - t0
+    if elapsed <= 0 or sum(totals) == 0:
+        return None
+    per_stream = [t / 1048576 / elapsed for t in totals]
+    return {"per_stream": per_stream, "total": sum(per_stream), "streams": streams}
 
 class SpeedTester:
     def __init__(self, config_path, workdir, mixed_port, api_port, size_mb, max_time,
@@ -852,6 +1097,53 @@ class SpeedTester:
                     break
         return info, res, last_err
 
+    def emby_pressure_test(self, name, duration=60, streams=2):
+        """Emby 晚高峰压力测试（节点间串行调用，防失真）。
+
+        Phase A 单路持续：单连接下载 duration 秒，逐秒采样 → avg/min/P10 卡顿线，
+        前 1/3 vs 后 1/3 均速的限速比（晚高峰 QoS 常在持续流量几十秒后才压速，短测看不出）。
+        Phase B 多路并发：N 路独立单连接同时下载（N 台设备同时看），最差一路定档。"""
+        if not self.select(name):
+            return None, "select failed"
+        time.sleep(0.5)
+        proxies = {"http": f"http://127.0.0.1:{self.mixed_port}",
+                   "https": f"http://127.0.0.1:{self.mixed_port}"}
+        # 防重连失真教训：按 duration×55MB/s 预留文件大小上限，保证单连接全程不重连
+        size_bytes = int(min(max(200, duration * 55), 1000) * 1048576)
+        a_res, last_err = None, None
+        for url in self.test_urls:
+            a_res, last_err = stream_download(url, proxies, duration, size_bytes, self.max_time)
+            if a_res is not None:
+                break
+        if a_res is None:
+            return None, last_err or "phase A failed"
+        samples = a_res.get("samples") or []
+        body = samples[1:] if len(samples) > 1 else samples  # 排除首秒慢启动
+        third = max(1, len(body) // 3)
+        first3 = sum(body[:third]) / third if body else 0.0
+        last3 = sum(body[-third:]) / third if body else 0.0
+        throttle = round(last3 / first3, 2) if first3 > 0.5 else 1.0
+        phaseA = {"avg": round(a_res["avg"], 2), "min": round(a_res["min"], 2),
+                  "p10": round(percentile(body, 10), 2) if body else None,
+                  "first3": round(first3, 2), "last3": round(last3, 2),
+                  "throttle": throttle, "stalls": a_res.get("stalls", 0),
+                  "samples": samples}
+        phaseB = None
+        for url in self.test_urls:
+            b = stream_download_streams(url, proxies, duration, size_bytes,
+                                        self.max_time, streams)
+            if b is not None:
+                worst = round(min(b["per_stream"]), 2)
+                phaseB = {"streams": streams,
+                          "per_stream": [round(x, 2) for x in b["per_stream"]],
+                          "worst": worst, "total": round(b["total"], 2),
+                          "verdict": emby_pressure_verdict(worst, streams)}
+                break
+        verdict = (phaseB or {}).get("verdict") or f"{emby_tier_of(phaseA['avg'])}×1路(仅单路)"
+        if throttle < 0.7:
+            verdict += "⚠限速"
+        return {"name": name, "phaseA": phaseA, "phaseB": phaseB, "verdict": verdict}, None
+
 # ---------------------------------------------------------------- 单实例多监听引擎（StairSpeedTest 同架构）
 
 class ListenerPool:
@@ -960,33 +1252,14 @@ class ListenerPool:
         proxies = {"http": f"http://127.0.0.1:{port}",
                    "https": f"http://127.0.0.1:{port}"}
         last_err = None
+        # 快扫只测单线程：单/多线程并发会互相压低（多线程抬高均值、单线程被挤），
+        # 且并发快扫下多线程数字本就是分摊带宽的噪声；多线程由精测阶段串行提供。
         for url in self.test_urls:
-            single_box, multi_box = [None], [None]
-
-            def do_single():
-                single_box[0], _ = stream_download(url, proxies, duration,
-                                                   self.size_bytes, self.max_time)
-
-            def do_multi():
-                multi_box[0], _ = stream_download_multi(url, proxies, duration,
-                                                        self.size_bytes, self.max_time,
-                                                        threads=self.threads)
-
-            t1 = threading.Thread(target=do_single)
-            t2 = threading.Thread(target=do_multi)
-            t1.start()
-            t2.start()
-            t1.join()
-            t2.join()
-            res, mres = single_box[0], multi_box[0]
-            if res is not None or mres is not None:
-                if res is None:
-                    res = mres
-                if mres:
-                    res["multi_avg"] = mres["avg"]
-                    res["multi_min"] = mres["min"]
+            res, err = stream_download(url, proxies, duration,
+                                       self.size_bytes, self.max_time)
+            if res is not None:
                 return name, info, res, None
-            last_err = "all urls failed"
+            last_err = err or "all urls failed"
         return name, info, None, last_err
 
     def sweep(self, nodes, duration, on_progress=None, concurrency=None):
@@ -1119,10 +1392,11 @@ def print_summary(summary):
         cons_s = f"{cons:.2f}" if cons is not None else "-"
         print(f"{name[:30]:<30} {len(e['avgs']):>4} {avg:>8.2f} {multi_s:>8} {mn:>8.2f} {st:>4} {stab:>6.2f} {lat_s:>7} {loss_s:>5} {cons_s:>6} {score:>4} {grade_of(score)}  {emby_verdict(avg, mn)}")
 
-def save_results(rounds, summary, out_base, size_mb, duration, test_url):
+def save_results(rounds, summary, out_base, size_mb, duration, test_url, userinfo=None, emby=None):
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     data = {"timestamp": stamp, "size_mb": size_mb, "duration_s": duration,
-            "test_url": test_url, "rounds": rounds,
+            "test_url": test_url, "userinfo": userinfo or {},
+            "emby": emby or [], "rounds": rounds,
             "summary": {k: {"rounds": len(v["avgs"]),
                             "avg_mbps": round(sum(v["avgs"]) / len(v["avgs"]), 2),
                             "multi_mbps": (round(sum(v["multis"]) / len(v["multis"]), 2) if v["multis"] else None),
@@ -1199,121 +1473,35 @@ def save_results(rounds, summary, out_base, size_mb, duration, test_url):
     return jpath, cpath, spath
 
 def generate_report(summary, out_base, title="机场节点测速报告"):
-    """生成 PNG 评分图 + HTML 报告（StairSpeedTest 风格）"""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from matplotlib import font_manager
-    for fname in ("Microsoft YaHei", "SimHei", "SimSun", "Noto Sans CJK SC", "DejaVu Sans"):
-        try:
-            font_manager.findfont(fname, fallback_to_default=False)
-            plt.rcParams["font.sans-serif"] = [fname]
-            break
-        except Exception:
-            continue
-    plt.rcParams["axes.unicode_minus"] = False
+    """生成 PNG 评分图 + HTML 报告 —— 委托 report.py（单一实现，图表/自检/排序共用）。
 
-    def _clean(s):
-        # 图表字体不含 emoji/部分符号，剥离后在图上显示
-        return "".join(ch for ch in s
-                       if not (0x1F000 <= ord(ch) <= 0x1FAFF)      # emoji/旗帜
-                       and not (0x2600 <= ord(ch) <= 0x27BF)       # ⚠ 等符号
-                       and not (0x2B00 <= ord(ch) <= 0x2BFF)
-                       and ord(ch) != 0x200D).strip()
-
-    items = []
-    for k, v in summary.items():
-        avg = sum(v["avgs"]) / len(v["avgs"])
-        lat = sum(v["lats"]) / len(v["lats"]) if v["lats"] else None
-        loss = sum(v["losses"]) / len(v["losses"]) if v["losses"] else None
-        st = sum(v["stalls"])
-        cons = calc_consistency(v["avgs"])
-        sc = compute_score({"avg": avg, "min": min(v["mins"]),
-                            "multi_avg": (sum(v["multis"]) / len(v["multis"]) if v["multis"] else None)},
-                           lat, loss, st, cons)
-        items.append((k, v, sc))
-    items.sort(key=lambda x: -x[2])
-    nodes = [(k, v) for k, v, _ in items if k != "直连(无代理)"]
-    top = nodes[:12][::-1]
-
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    png = f"{out_base}_report_{stamp}.png"
-    html = f"{out_base}_report_{stamp}.html"
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, max(8, 5 + len(nodes) * 0.28)))
-    fig.suptitle(f"{title}  {stamp[:4]}-{stamp[4:6]}-{stamp[6:8]} {stamp[8:10]}:{stamp[10:12]}",
-                 fontsize=14, fontweight="bold")
-
-    # 上图：Top 节点横向柱状（单线程速度 + 评分标注）
-    if top:
-        names = [_clean(k)[:22] for k, _ in top]
-        avgs = [sum(v["avgs"]) / len(v["avgs"]) for _, v in top]
-        multis = [sum(v["multis"]) / len(v["multis"]) if v["multis"] else None for _, v in top]
-        scores = []
-        for (_, v) in top:
-            lat = sum(v["lats"]) / len(v["lats"]) if v["lats"] else None
-            loss = sum(v["losses"]) / len(v["losses"]) if v["losses"] else None
-            scores.append(compute_score({"avg": sum(v["avgs"]) / len(v["avgs"]),
-                                         "min": min(v["mins"]),
-                                         "multi_avg": (sum(v["multis"]) / len(v["multis"]) if v["multis"] else None)},
-                                        lat, loss, sum(v["stalls"])))
-        colors = ["#2ecc71" if s >= 80 else "#f1c40f" if s >= 60 else "#e74c3c" for s in scores]
-        y = range(len(top))
-        ax1.barh(list(y), avgs, color=colors, alpha=0.85, label="单线程")
-        if any(multis):
-            ax1.barh(list(y), [m or 0 for m in multis], color="#3498db", alpha=0.45, label="多线程")
-        for yi, (nm, avg, sc) in zip(y, zip(names, avgs, scores)):
-            ax1.text(avg + 0.3, yi, f"{avg:.1f}MB/s  {grade_of(sc)}{sc}", va="center", fontsize=8)
-        ax1.set_yticks(list(y))
-        ax1.set_yticklabels(names, fontsize=8)
-        ax1.set_xlabel("MB/s")
-        ax1.set_title("Top 节点下行速度（单线程=实心，多线程=浅色）", fontsize=11)
-        ax1.grid(axis="x", alpha=0.3)
-        ax1.legend(fontsize=8)
-    else:
-        ax1.text(0.5, 0.5, "无可用节点", ha="center")
-
-    # 下图：全节点表格
-    ax2.axis("off")
-    rows_data = []
-    for k, v in nodes[:25]:
-        avg = sum(v["avgs"]) / len(v["avgs"])
-        mn = min(v["mins"])
-        lat = sum(v["lats"]) / len(v["lats"]) if v["lats"] else None
-        multi = sum(v["multis"]) / len(v["multis"]) if v["multis"] else None
-        loss = sum(v["losses"]) / len(v["losses"]) if v["losses"] else None
-        st = sum(v["stalls"])
-        cons = calc_consistency(v["avgs"])
-        sc = compute_score({"avg": avg, "min": mn, "multi_avg": multi}, lat, loss, st, cons)
-        rows_data.append([_clean(k)[:24], f"{lat:.0f}" if lat else "-",
-                          f"{loss:.0f}" if loss is not None else "-",
-                          f"{avg:.2f}", f"{multi:.2f}" if multi else "-",
-                          f"{mn:.2f}", f"{st}",
-                          f"{cons:.2f}" if cons is not None else "-",
-                          f"{sc} {grade_of(sc)}",
-                          _clean(emby_verdict(avg, mn))])
-    if rows_data:
-        tbl = ax2.table(cellText=rows_data,
-                        colLabels=["节点", "延迟ms", "丢包%", "单MB/s", "多MB/s",
-                                   "最低MB/s", "断流", "一致性", "评分", "评估"],
-                        loc="center", cellLoc="left")
-        tbl.auto_set_font_size(False)
-        tbl.set_fontsize(8)
-        tbl.scale(1, 1.15)
-    else:
-        ax2.text(0.5, 0.5, "无可用节点", ha="center", transform=ax2.transAxes, fontsize=12)
-    ax2.set_title(f"全部节点（共 {len(nodes)} 个，前 25 展示）", fontsize=11)
-
-    plt.tight_layout()
-    fig.savefig(png, dpi=130, bbox_inches="tight")
-    plt.close(fig)
-
-    with open(html, "w", encoding="utf-8") as f:
-        f.write(f"""<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
-<title>{title}</title></head><body style="font-family:Microsoft YaHei,sans-serif;background:#f5f6fa">
-<h2 style="text-align:center">{title}（{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]} {stamp[8:10]}:{stamp[10:12]}）</h2>
-<img src="{os.path.basename(png)}" style="max-width:100%">
-</body></html>""")
+    summary 参数仅为兼容旧调用而保留；实际数据从刚落盘的最新 result_*.json 读取，
+    保证与 main.py / webapp.py 走完全相同的报告管线。"""
+    import integrity as _integrity
+    import report as _report
+    cands = [f for f in glob.glob(os.path.join(RUNTIME_DIR, "result_2*.json"))
+             if "deep" not in os.path.basename(f) and "report" not in os.path.basename(f)
+             and "summary" not in os.path.basename(f)]
+    if not cands:
+        print("[!] --report：未找到 result_*.json，跳过报告生成")
+        return None, None
+    rj = max(cands, key=os.path.getmtime)
+    data = _report.load_result(rj)
+    rows = _report.build_rows(data)
+    stamp = data.get("timestamp", datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    meta = {"duration": data.get("duration_s", 0), "threads": 4,
+            "time": (datetime.datetime.strptime(stamp, "%Y%m%d_%H%M%S")
+                     if len(stamp) == 14 else datetime.datetime.now()),
+            "rounds": data.get("rounds", []),
+            "emby": data.get("emby", [])}
+    warnings = _integrity.analyze(data.get("summary", {}), meta)
+    w = _integrity.check_mihomo_instances()
+    if w:
+        warnings.insert(0, w)
+    png = os.path.join(RUNTIME_DIR, f"result_report_{stamp}.png")
+    html = os.path.join(RUNTIME_DIR, f"result_report_{stamp}.html")
+    _report.render_png(data, rows, warnings, png, title)
+    _report.render_html(data, rows, warnings, png, html, title, data.get("test_url", ""))
     return png, html
 
 # ---------------------------------------------------------------- 主流程
@@ -1324,7 +1512,8 @@ def do_selftest():
     for uri in SAMPLE_URIS:
         kind = uri.split("://")[0]
         fn = {"ss": parse_ss, "vmess": parse_vmess, "vless": parse_vless,
-              "trojan": parse_trojan, "ssr": parse_ssr}[kind]
+              "trojan": parse_trojan, "ssr": parse_ssr,
+              "hysteria2": parse_hysteria2, "tuic": parse_tuic}[kind]
         node = fn(uri, None)
         if node:
             print(f"[OK] {kind:<7} -> {node.get('name')!r} @ {node['server']}:{node['port']} "
@@ -1463,6 +1652,10 @@ def main():
     ap.add_argument("--sweep-duration", type=int, default=6,
                     help="快扫时每节点短测秒数（默认 6）")
     ap.add_argument("--test-url", default=None)
+    ap.add_argument("--test-ua", default="",
+                    help="测速下载使用的 User-Agent（Emby 源用客户端 UA，绕过禁网页播放的服务器）")
+    ap.add_argument("--test-token", default="",
+                    help="测速下载附带的 X-Emby-Token 头（Emby 头认证方案的直链）")
     ap.add_argument("--latency-timeout", type=int, default=3000, help="延迟测试超时(ms)，默认 3000（提速：死节点更快判定）")
     ap.add_argument("--latency-url", default="http://www.gstatic.com/generate_204")
     ap.add_argument("--probes", type=int, default=5,
@@ -1476,7 +1669,20 @@ def main():
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--no-download", action="store_true")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--emby", type=int, default=0,
+                    help="Emby 晚高峰压力测试：对评分 Top N 节点做 单路持续+多路并发 压测（0=关闭）")
+    ap.add_argument("--emby-streams", type=int, default=2,
+                    help="Emby 压测并发路数=同时观看的设备数（默认 2，1~4）")
+    ap.add_argument("--emby-duration", type=int, default=60,
+                    help="Emby 压测每阶段持续秒数（默认 60；短于 30s 测不出晚高峰 QoS 限速）")
+    ap.add_argument("--save", action="store_true",
+                    help="结果文件保留到程序目录（默认不保留，只写临时目录）")
     args = ap.parse_args()
+
+    if args.test_ua:
+        TEST_DOWNLOAD_HEADERS["User-Agent"] = args.test_ua
+    if args.test_token:
+        TEST_DOWNLOAD_HEADERS["X-Emby-Token"] = args.test_token
 
     if args.selftest:
         sys.exit(0 if do_selftest() else 1)
@@ -1485,11 +1691,15 @@ def main():
         sys.exit(1)
 
     print(f"[*] 读取订阅: {args.url}")
+    userinfo = {}
     try:
-        text, raw = load_subscription(args.url, args.ua)
+        text, raw, userinfo = load_subscription(args.url, args.ua)
     except Exception as e:
         print(f"[错误] 订阅读取失败: {e}")
         sys.exit(1)
+    uinfo_str = fmt_userinfo(userinfo)
+    if uinfo_str:
+        print(f"[*] 订阅信息: {uinfo_str}")
 
     # 自动 UA 兜底：部分机场按 UA 分发内容，不支持的 UA 会返回提示信息而非节点
     AUTO_UAS = ["clash-verge/v2.0.2", "v2rayNG/1.8.10", "mihomo/1.19.29",
@@ -1500,7 +1710,11 @@ def main():
                 continue
             print(f"[!] 当前 UA 被机场拒绝，尝试 UA: {ua}")
             try:
-                text, raw = fetch_subscription(args.url, ua)
+                text, raw, userinfo = fetch_subscription(args.url, ua)
+                if not uinfo_str:
+                    uinfo_str = fmt_userinfo(userinfo)
+                    if uinfo_str:
+                        print(f"[*] 订阅信息: {uinfo_str}")
                 if "不支持" not in text[:2000] and "请换用" not in text[:2000]:
                     print(f"[+] UA {ua} 可用")
                     break
@@ -1558,6 +1772,7 @@ def main():
 
     ensure_mihomo(allow_download=not args.no_download)
 
+    cleanup_runtime()  # 结果默认不保留：清掉上次运行的临时产物
     os.makedirs(WORK_DIR, exist_ok=True)
     mixed_port = pick_free_port([7890])
     api_port = pick_free_port([9090])
@@ -1627,6 +1842,7 @@ def main():
 
     rounds = []
     summary = {}
+    emby_results = []
     try:
         api_list = tester.get_proxies()
         # 注意：proxies 保持解析得到的完整节点（含 server/port/type），
@@ -1637,7 +1853,7 @@ def main():
         adaptive = args.adaptive or (args.loop > 1 and not args.no_adaptive)
         elim = max(2, args.elim_rounds)
         node_states = {p["name"]: {"state": "full", "flags": 0, "since": 0} for p in proxies}
-        tracker = ProgressTracker(TOOL_DIR)
+        tracker = ProgressTracker(RUNTIME_DIR)
         tracker.set_phase("初始化", message=f"共 {len(proxies)} 个节点")
         tracker.save()
         use_sweep = (args.sweep or args.loop > 1) and not args.no_sweep and not args.accurate
@@ -1854,6 +2070,49 @@ def main():
                     e["stalls"].append(row["res"].get("stalls", 0) + row["res"].get("reconnects", 0))
             print()
             print_table(round_rows)
+
+        # ===== Emby 晚高峰压力测试（Top N，节点间串行） =====
+        if args.emby:
+            def _score_of(e):
+                avg = sum(e["avgs"]) / len(e["avgs"])
+                lat = sum(e["lats"]) / len(e["lats"]) if e["lats"] else None
+                loss = sum(e["losses"]) / len(e["losses"]) if e["losses"] else None
+                multi = sum(e["multis"]) / len(e["multis"]) if e["multis"] else None
+                return compute_score({"avg": avg, "min": min(e["mins"]), "multi_avg": multi},
+                                     lat, loss, sum(e["stalls"]), calc_consistency(e["avgs"]))
+            ranked = sorted(summary.items(), key=lambda kv: -_score_of(kv[1]))
+            top = [k for k, _ in ranked if "直连" not in k][:args.emby]
+            streams = max(1, min(4, args.emby_streams))
+            dur = max(15, args.emby_duration)
+            print(f"\n{'=' * 60}\n[Emby 晚高峰压力测试] Top {len(top)} 节点 · "
+                  f"单路持续 {dur}s + {streams} 路并发 {dur}s（模拟多设备同时观看）\n{'=' * 60}")
+            tracker.set_phase("Emby 压测", 0, len(top), f"单路{dur}s + {streams}路并发{dur}s")
+            tracker.save()
+            for i, name in enumerate(top, 1):
+                print(f"  [{i}/{len(top)}] {name[:40]} 压测中...", flush=True)
+                entry, err = tester.emby_pressure_test(name, dur, streams)
+                if entry:
+                    emby_results.append(entry)
+                    pa = entry["phaseA"]
+                    pb = entry.get("phaseB") or {}
+                    print(f"      单路 avg={pa['avg']} min={pa['min']} P10={pa['p10']} "
+                          f"限速比={pa['throttle']} | {streams}路最差={pb.get('worst')}"
+                          f" → {entry['verdict']}", flush=True)
+                else:
+                    emby_results.append({"name": name, "error": err or "压测失败"})
+                    print(f"      压测失败: {err}", flush=True)
+                tracker.set_phase("Emby 压测", i, len(top), name[:30])
+                tracker.save()
+            if emby_results:
+                print("\n=== Emby 压测汇总（按单路 avg 降序）===")
+                ok = [e for e in emby_results if e.get("phaseA")]
+                ok.sort(key=lambda e: -e["phaseA"]["avg"])
+                for e in ok:
+                    pa = e["phaseA"]
+                    pb = e.get("phaseB") or {}
+                    th = f"{pa['throttle']:.0%}" if pa.get("throttle") is not None else "-"
+                    print(f"  {e['name'][:28]:<28} 单路{pa['avg']:>7.2f} P10={pa['p10'] or 0:>6.2f} "
+                          f"限速比{th:>4} | 最差路{pb.get('worst') or '-':>7} {e['verdict']}")
     finally:
         if pool:
             pool.stop()
@@ -1868,12 +2127,21 @@ def main():
             pass
 
     print_summary(summary)
-    j, c, s = save_results(rounds, summary, os.path.join(TOOL_DIR, "result"),
-                           args.size_mb, args.duration, test_urls[0])
-    print(f"\n[+] 轮次明细: {j}\n[+] CSV: {c}\n[+] 汇总: {s}")
+    j, c, s = save_results(rounds, summary, os.path.join(RUNTIME_DIR, "result"),
+                           args.size_mb, args.duration, test_urls[0],
+                           userinfo=userinfo, emby=emby_results)
+    print(f"\n[+] 轮次明细(临时): {j}\n[+] CSV(临时): {c}\n[+] 汇总(临时): {s}")
+    if args.save:
+        n = copy_artifacts_to_save(os.path.basename(j)[len("result_"):-len(".json")])
+        print(f"[+] --save：{n} 个结果文件已保留到 {SAVE_DIR}")
+    else:
+        print("[*] 结果默认不保留本地（临时目录存放）；需要保留请加 --save")
     if args.report:
         png, html = generate_report(summary, os.path.join(TOOL_DIR, "result"))
-        print(f"[+] 评分图: {png}\n[+] HTML报告: {html}")
+        if png:
+            print(f"[+] 评分图: {png}\n[+] HTML报告: {html}")
+            if args.save:
+                copy_artifacts_to_save(os.path.basename(j)[len("result_"):-len(".json")])
 
 if __name__ == "__main__":
     main()

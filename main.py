@@ -113,18 +113,19 @@ def run_ookla_deep(proxies, top_names, duration=20, base_port=7850):
         port = base_port + i * 2
         api = port + 1
         cfg = engine.build_config([proxy], port, api)
-        cfg_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "work", "deep.yaml")
-        os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+        work_dir = engine.WORK_DIR
+        cfg_path = os.path.join(work_dir, "deep.yaml")
+        os.makedirs(work_dir, exist_ok=True)
         with open(cfg_path, "w", encoding="utf-8") as f:
             f.write(cfg)
         # 确保 GeoIP 库就位（mihomo 缺它无法启动）
-        geo_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "geoip.metadb")
-        geo_dst = os.path.join(os.path.dirname(cfg_path), "geoip.metadb")
+        geo_src = os.path.join(os.path.dirname(engine.MIHOMO_EXE), "geoip.metadb")
+        geo_dst = os.path.join(work_dir, "geoip.metadb")
         if os.path.exists(geo_src) and not os.path.exists(geo_dst):
             import shutil
             shutil.copy(geo_src, geo_dst)
-        logf = open(os.path.join(os.path.dirname(cfg_path), "deep_mihomo.log"), "w", encoding="utf-8")
-        proc = subprocess.Popen([MIHOMO, "-d", os.path.dirname(cfg_path), "-f", cfg_path],
+        logf = open(os.path.join(work_dir, "deep_mihomo.log"), "w", encoding="utf-8")
+        proc = subprocess.Popen([engine.MIHOMO_EXE, "-d", work_dir, "-f", cfg_path],
                                 stdout=logf, stderr=subprocess.STDOUT)
         print(f"\n=== 深测 {name} ===", flush=True)
         if not _wait_port(port):
@@ -173,7 +174,10 @@ def main():
             raise
 
     # 生成 StairSpeedTest 风格报告（PNG + 单文件 HTML）
-    out_dir = os.path.dirname(os.path.abspath(__file__))
+    if "--list-only" in rest:
+        return  # 只列节点，无测速数据，跳过报告
+    import engine
+    out_dir = engine.RUNTIME_DIR  # 报告进临时目录：结果默认不落盘，--save 才保留
     rj = newest_result(out_dir)
     if not rj:
         print("[!] 未找到测速结果 JSON，跳过报告生成")
@@ -184,7 +188,7 @@ def main():
     stamp = data.get("timestamp", datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
     meta = {"duration": data.get("duration_s", 0), "threads": 4,
             "time": datetime.datetime.strptime(stamp, "%Y%m%d_%H%M%S") if len(stamp) == 14 else datetime.datetime.now(),
-            "rounds": data.get("rounds", [])}
+            "rounds": data.get("rounds", []), "emby": data.get("emby", [])}
     warnings = integrity.analyze(data.get("summary", {}), meta)
 
     # Ookla/trevor 深测（可选 --ookla N）
@@ -194,7 +198,7 @@ def main():
         top_names = [r["name"] for r in rows[:own["ookla"]]]
         try:
             # 重新解析订阅得到完整节点
-            text, raw = engine.load_subscription(rest[0], engine.DEFAULT_UA)
+            text, raw, _info = engine.load_subscription(rest[0], engine.DEFAULT_UA)
             proxies = engine.parse_subscription_text(text)
             if not proxies and "proxies:" in text[:2000]:
                 import yaml
@@ -214,8 +218,16 @@ def main():
     html = os.path.join(out_dir, f"result_report_{stamp}.html")
     report.render_png(data, rows, warnings, png, own["title"])
     report.render_html(data, rows, warnings, png, html, own["title"], own["source_url"])
-    print(f"[+] 评分图: {png}")
-    print(f"[+] HTML报告: {html}")
+    print(f"[+] 评分图(临时): {png}")
+    print(f"[+] HTML报告(临时): {html}")
+    if "--save" in rest:
+        n = engine.copy_artifacts_to_save(stamp)
+        print(f"[+] --save：{n} 个结果文件已保留到 {engine.SAVE_DIR}")
+    try:
+        import webbrowser
+        webbrowser.open(f"file:///{html.replace(os.sep, '/')}")
+    except Exception:
+        pass
     for wmsg in warnings:
         print(f"    ! {wmsg}")
     q, qmsg = integrity.verdict(warnings)

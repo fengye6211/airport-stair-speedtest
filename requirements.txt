@@ -1,3 +1,4 @@
 requests>=2.31
 pyyaml>=6.0
 matplotlib>=3.5
+# 打包 exe（仅构建时需要，运行不需要）：pip install pyinstaller

@@ -3,6 +3,11 @@ work/
 __pycache__/
 *.pyc
 
+# PyInstaller build outputs (regenerable via build_exe.bat)
+build/
+dist/
+*.spec
+
 # kernels & databases (auto-downloaded on first run)
 tools/mihomo.exe
 tools/mihomo-*.zip

@@ -51,6 +51,7 @@ def build_rows(data):
         sc = compute_score({"avg": avg, "min": mn, "multi_avg": multi}, lat, loss, st, cons)
         rows.append({"name": k, "avg": avg, "min": mn, "multi": multi, "lat": lat,
                      "loss": loss, "stalls": st, "cons": cons, "score": sc,
+                     "rounds": v.get("rounds") or len(v["avgs"]),
                      "grade": grade_of(sc), "verdict": emby_verdict(avg, mn)})
     rows.sort(key=lambda r: -r["score"])
     return rows
@@ -74,12 +75,18 @@ def render_png(data, rows, warnings, out_path, title):
     stamp = data.get("timestamp", datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
     n_nodes = len(rows)
     n_dead = len(data.get("summary", {})) - 1 - n_nodes  # summary含直连
+    emby = [e for e in (data.get("emby") or [])
+            if isinstance(e, dict) and e.get("phaseA")]
 
-    fig = plt.figure(figsize=(14, max(10, 5.5 + n_nodes * 0.24 + len(warnings) * 0.3)))
-    gs = fig.add_gridspec(3, 1, height_ratios=[2.2, 1.2, 2.6], hspace=0.45)
+    n_panels = 3 + (2 if emby else 0)
+    ratios = [2.2, 1.2] + ([1.6, 2.0] if emby else []) + [2.6]
+    fig = plt.figure(figsize=(14, max(10, 5.5 + n_nodes * 0.24 + len(warnings) * 0.3
+                                         + (3.0 if emby else 0))))
+    gs = fig.add_gridspec(n_panels, 1, height_ratios=ratios, hspace=0.45)
+    pi = 0
 
     # ---- 面板1：Top 速度柱状（单线程实心 + 多线程浅色 + 评分/等级）----
-    ax1 = fig.add_subplot(gs[0])
+    ax1 = fig.add_subplot(gs[pi]); pi += 1
     if top:
         names = [_clean(r["name"])[:20] for r in top]
         avgs = [r["avg"] for r in top]
@@ -105,7 +112,7 @@ def render_png(data, rows, warnings, out_path, title):
         ax1.text(0.5, 0.5, "无可用节点", ha="center", transform=ax1.transAxes)
 
     # ---- 面板2：延迟柱状 ----
-    ax2 = fig.add_subplot(gs[1])
+    ax2 = fig.add_subplot(gs[pi]); pi += 1
     lat_rows = [r for r in rows if r["lat"]][:12][::-1]
     if lat_rows:
         names2 = [_clean(r["name"])[:16] for r in lat_rows]
@@ -122,19 +129,65 @@ def render_png(data, rows, warnings, out_path, title):
     else:
         ax2.text(0.5, 0.5, "无延迟数据", ha="center", transform=ax2.transAxes)
 
+    # ---- Emby 面板A：Top5 单路逐秒速度曲线（晚高峰限速可视化）----
+    if emby:
+        axc = fig.add_subplot(gs[pi]); pi += 1
+        curve_top = sorted(emby, key=lambda e: -e["phaseA"]["avg"])[:5]
+        for e in curve_top:
+            s = e["phaseA"].get("samples") or []
+            axc.plot(range(len(s)), s, linewidth=1.2, label=_clean(e["name"])[:16])
+        for th, nm in ((8, "1080p"), (15, "1080p高码"), (30, "4K高码"), (50, "4K原盘")):
+            axc.axhline(th, color="#7f8c8d", linestyle="--", linewidth=0.6, alpha=0.7)
+            axc.text(0.3, th + 0.4, f"{nm} {th}MB/s", fontsize=6.5, color="#7f8c8d")
+        axc.set_xlabel("秒")
+        axc.set_ylabel("MB/s")
+        axc.set_title("Emby 压测 · Top5 单路逐秒速度曲线（虚线=播放档位，曲线尾段下坠=持续流量被限速）",
+                      fontsize=10)
+        axc.legend(fontsize=7, loc="upper right")
+        axc.grid(alpha=0.25)
+        axc.set_ylim(bottom=0)
+
+        # ---- Emby 面板B：压测结果表 ----
+        axe = fig.add_subplot(gs[pi]); pi += 1
+        axe.axis("off")
+        emby_sorted = sorted(emby, key=lambda e: -e["phaseA"]["avg"])
+        emby_rows = []
+        for e in emby_sorted:
+            pa, pb = e["phaseA"], e.get("phaseB") or {}
+            per = "/".join(f"{x:.0f}" for x in pb.get("per_stream") or []) or "-"
+            emby_rows.append([
+                _clean(e["name"])[:22],
+                f"{pa['avg']:.1f}",
+                f"{pa['p10']:.1f}" if pa.get("p10") is not None else "-",
+                f"{pa['throttle']:.0%}" if pa.get("throttle") is not None else "-",
+                f"{pa['last3']:.1f}",
+                per,
+                f"{pb.get('worst')}" if pb.get("worst") is not None else "-",
+                _clean(e.get("verdict", "-"))])
+        tbl_e = axe.table(cellText=emby_rows,
+                          colLabels=["节点", "单路avg", "P10卡顿线", "限速比",
+                                     "后1/3均速", "每路MB/s", "最差路", "判定"],
+                          loc="center", cellLoc="left")
+        tbl_e.auto_set_font_size(False)
+        tbl_e.set_fontsize(7.5)
+        tbl_e.scale(1, 1.15)
+        axe.set_title(f"Emby 晚高峰压力测试（{len(emby_sorted)} 节点 · 限速比<70% 即长片源会卡）",
+                      fontsize=10)
+
     # ---- 面板3：全节点表格 ----
-    ax3 = fig.add_subplot(gs[2])
+    ax3 = fig.add_subplot(gs[pi])
     ax3.axis("off")
     rows_data = [[_clean(r["name"])[:22], f"{r['lat']:.0f}" if r["lat"] else "-",
                   f"{r['loss']:.0f}" if r["loss"] is not None else "-",
                   f"{r['avg']:.2f}", f"{r['multi']:.2f}" if r["multi"] else "-",
                   f"{r['min']:.2f}", f"{r['stalls']}",
                   f"{r['cons']:.2f}" if r["cons"] is not None else "-",
+                  f"{r['rounds']}",
                   f"{r['score']} {r['grade']}", _clean(r["verdict"])] for r in rows[:25]]
     if rows_data:
         tbl = ax3.table(cellText=rows_data,
                         colLabels=["节点", "延迟ms", "丢包%", "单MB/s", "多MB/s",
-                                   "最低MB/s", "断流", "一致性", "评分", "评估"],
+                                   "最低MB/s", "断流", "一致性", "轮次", "评分", "评估"],
                         loc="center", cellLoc="left")
         tbl.auto_set_font_size(False)
         tbl.set_fontsize(7.5)
@@ -148,7 +201,10 @@ def render_png(data, rows, warnings, out_path, title):
     axw.text(0, 1, "\n".join(warnings[:8]), va="top", ha="left", fontsize=7.5, color="#c0392b")
 
     q, qmsg = integrity.verdict(warnings)
-    fig.suptitle(f"{title}  [{q}级数据质量]  {stamp[:4]}-{stamp[4:6]}-{stamp[6:8]} "
+    n_rounds = len(data.get("rounds") or [])
+    round_note = f"共{n_rounds}轮" if n_rounds > 1 else ""
+    fig.suptitle(f"{title}  [{q}级数据质量]{('  ' + round_note) if round_note else ''}  "
+                 f"{stamp[:4]}-{stamp[4:6]}-{stamp[6:8]} "
                  f"{stamp[8:10]}:{stamp[10:12]}   {qmsg}",
                  fontsize=13, fontweight="bold")
     fig.savefig(out_path, dpi=140, bbox_inches="tight")
@@ -171,9 +227,33 @@ def render_html(data, rows, warnings, png_path, out_path, title, source_url):
             + ("<td>" + f"{r['multi']:.2f}</td>" if r["multi"] else "<td>-</td>")
             + "<td>" + f"{r['min']:.2f}</td><td>{r['stalls']}</td>"
             + ("<td>" + f"{r['cons']:.2f}</td>" if r["cons"] is not None else "<td>-</td>")
+            + f"<td>{r['rounds']}</td>"
             + "<td><span class='g" + str(r["grade"]) + "'>" + f"{r['score']} {r['grade']}</span></td>"
             + "<td class='l'>" + str(r["verdict"]) + "</td></tr>")
     warns_html = "".join(f"<li>{w}</li>" for w in warnings) or "<li>无（通过自检）</li>"
+    emby = [e for e in (data.get("emby") or [])
+            if isinstance(e, dict) and e.get("phaseA")]
+    emby_html = ""
+    if emby:
+        etrs = []
+        for e in sorted(emby, key=lambda x: -x["phaseA"]["avg"]):
+            pa, pb = e["phaseA"], e.get("phaseB") or {}
+            per = " / ".join(f"{x:.1f}" for x in pb.get("per_stream") or []) or "-"
+            etrs.append(
+                "<tr><td class='l'>" + str(e["name"]) + "</td>"
+                + f"<td><b>{pa['avg']:.1f}</b></td>"
+                + (f"<td>{pa['p10']:.1f}</td>" if pa.get("p10") is not None else "<td>-</td>")
+                + (f"<td>{pa['throttle']:.0%}</td>" if pa.get("throttle") is not None else "<td>-</td>")
+                + f"<td>{pa['last3']:.1f}</td>"
+                + f"<td>{per}</td>"
+                + (f"<td><b>{pb['worst']:.1f}</b></td>" if pb.get("worst") is not None else "<td>-</td>")
+                + f"<td class='l'>{e.get('verdict', '-')}</td></tr>")
+        emby_html = ("<h2>Emby 晚高峰压力测试（单路持续 + 多路并发）</h2>"
+                     "<table><thead><tr><th>节点</th><th>单路avg</th><th>P10卡顿线</th>"
+                     "<th>限速比</th><th>后1/3均速</th><th>每路MB/s</th><th>最差路</th>"
+                     "<th>判定</th></tr></thead><tbody>" + "".join(etrs) + "</tbody></table>"
+                     "<p class='meta'>限速比 = 后1/3均速 ÷ 前1/3均速，&lt;70% 表示持续流量被限速（长片源越看越卡）；"
+                     "最差一路决定多设备同时观看的档位。</p>")
     html = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
 <title>__TITLE__ · 测速报告</title>
 <style>
@@ -194,14 +274,15 @@ td.l{text-align:left}
 .qA{color:#22c55e;font-weight:bold}.qB{color:#eab308;font-weight:bold}.qC{color:#ef4444;font-weight:bold}
 </style></head><body>
 <h1>🌐 __TITLE__</h1>
-<p class="meta">时间戳 __STAMP__ · 数据质量: <span class="q__Q__">__Q__级 · __QMSG__</span></p>
-<p class="meta">订阅来源: __SOURCE__ · 原始数据: 同目录 result_*.json（含逐秒采样，可复核）</p>
+<p class="meta">时间戳 __STAMP__ · 数据质量: <span class="q__Q__">__Q__级 · __QMSG__</span> · __ROUNDS__</p>
+<p class="meta">订阅来源: __SOURCE__ · 测速源: __TESTURL__ · 原始数据: 同目录 result_*.json（含逐秒采样，可复核）</p>
 <h2>测速图</h2>
 <img src="data:image/png;base64,__B64__" alt="测速图">
 <h2>数据真实性自检</h2>
 <ul class="warn">__WARNS__</ul>
-<h2>全部节点明细（点击表头排序）</h2>
-<table id="t"><thead><tr><th>节点</th><th>延迟ms</th><th>丢包%</th><th>单MB/s</th><th>多MB/s</th><th>最低MB/s</th><th>断流</th><th>一致性</th><th>评分</th><th>评估</th></tr></thead>
+__EMBY__
+<h2>全部节点明细（点击表头排序，多轮数据为各轮汇总均值）</h2>
+<table id="t"><thead><tr><th>节点</th><th>延迟ms</th><th>丢包%</th><th>单MB/s</th><th>多MB/s</th><th>最低MB/s</th><th>断流</th><th>一致性</th><th>轮次</th><th>评分</th><th>评估</th></tr></thead>
 <tbody>__ROWS__</tbody></table>
 <script>
 const t=document.getElementById('t');let dir=1;
@@ -211,13 +292,17 @@ const nx=parseFloat(x),ny=parseFloat(y);return (isNaN(nx)?x.localeCompare(y):nx-
 .forEach(r=>tb.appendChild(r));});
 </script>
 </body></html>"""
+    n_rounds_html = len(data.get("rounds") or [])
     html = (html.replace("__TITLE__", str(title))
                 .replace("__STAMP__", str(stamp))
                 .replace("__Q__", str(q))
                 .replace("__QMSG__", str(qmsg))
+                .replace("__ROUNDS__", f"共 {n_rounds_html} 轮汇总" if n_rounds_html > 1 else "单轮")
                 .replace("__SOURCE__", str(source_url or "本地文件"))
+                .replace("__TESTURL__", str(data.get("test_url") or "默认防失真列表"))
                 .replace("__B64__", b64)
                 .replace("__WARNS__", warns_html)
+                .replace("__EMBY__", emby_html)
                 .replace("__ROWS__", "".join(trs)))
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -238,7 +323,7 @@ def main():
     out_dir = args.out_dir or os.path.dirname(os.path.abspath(args.result_json))
     meta = {"duration": data.get("duration_s", 0), "threads": 4,
             "time": datetime.datetime.strptime(stamp, "%Y%m%d_%H%M%S") if len(stamp) == 14 else datetime.datetime.now(),
-            "rounds": data.get("rounds", [])}
+            "rounds": data.get("rounds", []), "emby": data.get("emby", [])}
     warnings = integrity.analyze(data.get("summary", {}), meta)
     w = integrity.check_mihomo_instances()
     if w:

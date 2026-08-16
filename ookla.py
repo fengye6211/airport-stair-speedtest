@@ -94,13 +94,21 @@ def parallel_download(proxy_port, servers, duration=20, streams=8, chunk=65536):
 
 
 def run(proxy_port, duration=20, streams=8, api_base="www.speedtest.net", server_count=3):
-    """一站式：取服务器 → 并行下载"""
+    """一站式：取服务器 → 并行下载。
+
+    服务器列表优先走被测节点的代理获取：国内直连 speedtest.net API 常被墙；
+    且经代理取到的列表是「出口附近」的服务器，与网页版经该出口测速的行为一致。
+    代理获取失败再回退直连。"""
+    servers = []
     try:
-        servers = fetch_servers(api_base, limit=20, proxy_port=None)[:server_count]
-        if not servers:
-            return {"ok": False, "err": f"{api_base} 服务器列表为空"}
-    except Exception as e:
-        return {"ok": False, "err": f"服务器列表获取失败: {str(e)[:80]}"}
+        servers = fetch_servers(api_base, limit=20, proxy_port=proxy_port)[:server_count]
+    except Exception:
+        servers = []
+    if not servers:
+        try:
+            servers = fetch_servers(api_base, limit=20, proxy_port=None)[:server_count]
+        except Exception as e:
+            return {"ok": False, "err": f"服务器列表获取失败: {str(e)[:80]}"}
     return parallel_download(proxy_port, servers, duration, streams)
 
 

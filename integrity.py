@@ -27,6 +27,7 @@ def norm_summary(summary):
             "lats": [v["avg_latency_ms"]] if v.get("avg_latency_ms") is not None else [],
             "losses": [v["loss_pct"]] if v.get("loss_pct") is not None else [],
             "stalls": v.get("stalls", 0) if isinstance(v.get("stalls"), (int, float)) else sum(v.get("stalls", []) or []),
+            "rounds": v.get("rounds") if isinstance(v.get("rounds"), int) else None,
         }
     return out
 
@@ -106,11 +107,28 @@ def analyze(summary, meta=None):
     if heavy:
         warns.append(f"[断流严重] " + "、".join(heavy[:6]) + " —— 看视频会频繁卡顿")
 
-    # 6) 多线程缺失
-    if meta.get("threads", 1) > 1:
+    # 6) 多线程缺失（仅精测模式检查：快扫只测单线程是设计，不告警）
+    if meta.get("threads", 1) > 1 and meta.get("duration", 0) > 0:
         missing = [k[:18] for k, v in nodes.items() if not v.get("multis")]
         if missing:
             warns.append(f"[多线程缺失] {len(missing)} 个节点多线程测试失败: " + "、".join(missing[:5]))
+
+    # 7) Emby 压测：晚高峰 QoS 限速 / 多路并发不足
+    throttled, starved = [], []
+    for e in meta.get("emby") or []:
+        if not isinstance(e, dict):
+            continue
+        pa = e.get("phaseA") or {}
+        pb = e.get("phaseB") or {}
+        th = pa.get("throttle")
+        if th is not None and th < 0.7 and pa.get("first3"):
+            throttled.append(f"{e.get('name', '?')[:18]}(前{pa['first3']:.0f}→后{pa['last3']:.0f}MB/s,{th:.0%})")
+        if pb and pb.get("worst") is not None and pb["worst"] < 8:
+            starved.append(f"{e.get('name', '?')[:18]}({pb['streams']}路最差{pb['worst']:.1f}MB/s)")
+    if throttled:
+        warns.append("[晚高峰限速] 持续流量后被压速（长片源会越看越卡）: " + "、".join(throttled[:4]))
+    if starved:
+        warns.append("[多路不足] 多设备同时观看会卡（最差一路<8MB/s）: " + "、".join(starved[:4]))
 
     return warns
 
@@ -119,8 +137,11 @@ def check_mihomo_instances():
     """检测是否存在多个 mihomo 实例（并发互扰风险）"""
     import subprocess
     try:
+        # errors="replace"：中文 Windows 的 tasklist 输出为 GBK，
+        # 若系统开了 UTF-8 模式（PYTHONUTF8=1）按 utf-8 解码会抛异常；ASCII 的
+        # "mihomo.exe" 不受替换影响，计数仍准确
         out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq mihomo.exe", "/FO", "CSV", "/NH"],
-                             capture_output=True, text=True, timeout=10).stdout
+                             capture_output=True, text=True, errors="replace", timeout=10).stdout
         n = sum(1 for line in out.splitlines() if "mihomo" in line.lower())
         if n > 1:
             return f"[并发互扰] 检测到 {n} 个 mihomo 实例在运行，可能互相抢占机场带宽导致数据失真；建议关闭其他代理客户端/测试进程"
